@@ -300,6 +300,22 @@ INFINIOP_CUDA_KERNEL flashAttentionDecodeHd128GqaSplitKv(
         v_batch_stride, v_row_stride, v_head_stride, num_splits);
 }
 
+
+template <typename Tindex, typename Tdata>
+INFINIOP_CUDA_KERNEL flashAttentionDecodeHd128GqaSharedSplitKv(
+    float *partial_acc, float *partial_m, float *partial_l,
+    const Tdata *q, const Tdata *k_cache, const Tdata *v_cache,
+    const Tindex *block_tables, const Tindex *cache_lens, const float *alibi_slopes,
+    size_t num_kv_heads, float scale, size_t max_num_blocks_per_seq, size_t page_block_size,
+    ptrdiff_t q_stride, ptrdiff_t k_batch_stride, ptrdiff_t k_row_stride, ptrdiff_t k_head_stride,
+    ptrdiff_t v_batch_stride, ptrdiff_t v_row_stride, ptrdiff_t v_head_stride, int num_splits) {
+    op::paged_attention::cuda::flashAttentionDecodeSplitKvSharedKernel<Tindex, Tdata, 128, 8>(
+        partial_acc, partial_m, partial_l, q, k_cache, v_cache, block_tables, cache_lens,
+        alibi_slopes, num_kv_heads, scale, max_num_blocks_per_seq, page_block_size,
+        q_stride, k_batch_stride, k_row_stride, k_head_stride,
+        v_batch_stride, v_row_stride, v_head_stride, num_splits);
+}
+
 template <typename Tindex, typename Tdata>
 INFINIOP_CUDA_KERNEL flashAttentionDecodeHd128SplitKvCta(
     float *partial_acc,
@@ -529,6 +545,9 @@ infiniStatus_t launch_decode_hd128_impl(
     const bool use_gqa_split = envBool("INFINIOP_FLASH_GQA_SPLITKV") &&
         use_split && use_cta && alibi_slopes == nullptr &&
         num_kv_heads > 0 && num_heads == num_kv_heads * 4;
+    const bool use_gqa_shared_split = envBool("INFINIOP_FLASH_GQA_SHARED_SPLITKV") &&
+        use_split && use_cta && alibi_slopes == nullptr &&
+        num_kv_heads > 0 && num_heads == num_kv_heads * 4;
 
     const bool debug_dispatch = envBool("INFINIOP_FLASH_DEBUG_DISPATCH");
     auto dump_dispatch = [&](const char *path) {
@@ -652,7 +671,7 @@ infiniStatus_t launch_decode_hd128_impl(
 
     dim3 grid(static_cast<uint64_t>(num_heads), static_cast<uint64_t>(num_seqs), 1);
     if (use_split) {
-        dump_dispatch(use_cta ? "splitkv_cta" : "splitkv_warp");
+        dump_dispatch(use_gqa_shared_split ? "splitkv_gqa_shared" : (use_gqa_split ? "splitkv_gqa_4warp" : (use_cta ? "splitkv_cta" : "splitkv_warp")));
         // }
         if (!fixed_num_splits) {
             // Approximate seqlen_k by the per-seq KV capacity (paged KV upper bound).
@@ -685,8 +704,35 @@ infiniStatus_t launch_decode_hd128_impl(
         float *partial_m = partial_acc + acc_elems;
         float *partial_l = partial_m + m_elems;
 
-        dim3 grid_split(static_cast<uint64_t>(use_gqa_split ? num_kv_heads : num_heads), static_cast<uint64_t>(num_seqs), static_cast<uint64_t>(num_splits));
-        dim3 block_split(use_gqa_split ? 128 : (use_cta ? static_cast<uint32_t>(cta_threads) : 32));
+        dim3 grid_split(static_cast<uint64_t>((use_gqa_shared_split || use_gqa_split) ? num_kv_heads : num_heads), static_cast<uint64_t>(num_seqs), static_cast<uint64_t>(num_splits));
+        dim3 block_split((use_gqa_shared_split || use_gqa_split) ? 128 : (use_cta ? static_cast<uint32_t>(cta_threads) : 32));
+
+        if (use_gqa_shared_split) {
+            dump_dispatch("splitkv_gqa_shared");
+            if (dtype == INFINI_DTYPE_F16) {
+                flashAttentionDecodeHd128GqaSharedSplitKv<Tindex, half><<<grid_split, block_split, 0, stream>>>(
+                    partial_acc, partial_m, partial_l, static_cast<const half *>(q),
+                    static_cast<const half *>(k_cache), static_cast<const half *>(v_cache),
+                    block_tables, cache_lens, alibi_slopes, num_kv_heads, scale,
+                    max_num_blocks_per_seq, page_block_size, q_stride, k_batch_stride,
+                    k_row_stride, k_head_stride, v_batch_stride, v_row_stride, v_head_stride, num_splits);
+                flashAttentionDecodeHd128SplitKvCombine<half><<<grid, 32, 0, stream>>>(
+                    static_cast<half *>(out), partial_acc, partial_m, partial_l, num_splits, o_stride);
+                return INFINI_STATUS_SUCCESS;
+            }
+            if (dtype == INFINI_DTYPE_BF16) {
+                flashAttentionDecodeHd128GqaSharedSplitKv<Tindex, __nv_bfloat16><<<grid_split, block_split, 0, stream>>>(
+                    partial_acc, partial_m, partial_l, static_cast<const __nv_bfloat16 *>(q),
+                    static_cast<const __nv_bfloat16 *>(k_cache), static_cast<const __nv_bfloat16 *>(v_cache),
+                    block_tables, cache_lens, alibi_slopes, num_kv_heads, scale,
+                    max_num_blocks_per_seq, page_block_size, q_stride, k_batch_stride,
+                    k_row_stride, k_head_stride, v_batch_stride, v_row_stride, v_head_stride, num_splits);
+                flashAttentionDecodeHd128SplitKvCombine<__nv_bfloat16><<<grid, 32, 0, stream>>>(
+                    static_cast<__nv_bfloat16 *>(out), partial_acc, partial_m, partial_l, num_splits, o_stride);
+                return INFINI_STATUS_SUCCESS;
+            }
+            return INFINI_STATUS_BAD_TENSOR_DTYPE;
+        }
 
         if (use_gqa_split) {
             dump_dispatch("splitkv_gqa_4warp");

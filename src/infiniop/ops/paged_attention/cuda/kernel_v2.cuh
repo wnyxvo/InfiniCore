@@ -557,6 +557,92 @@ __device__ void flashAttentionDecodeSplitKvWarpKernel(
     }
 }
 
+
+// Shared-KV Split-KV decode for GQA ratio 4. Four query-head warps in a CTA
+// cooperatively load one K/V tile into shared memory, then consume it with
+// independent softmax state. Workspace format matches the regular split path.
+template <typename Tindex, typename Tdata, int HEAD_SIZE, int TILE_TOKENS = 8>
+__device__ void flashAttentionDecodeSplitKvSharedKernel(
+    float *partial_acc, float *partial_m, float *partial_l,
+    const Tdata *q_, const Tdata *k_cache_, const Tdata *v_cache_,
+    const Tindex *block_tables_, const Tindex *cache_lens_, const float *alibi_slopes_,
+    size_t num_kv_heads, float scale, size_t max_num_blocks_per_seq,
+    size_t page_block_size, ptrdiff_t q_stride, ptrdiff_t k_batch_stride,
+    ptrdiff_t k_row_stride, ptrdiff_t k_head_stride, ptrdiff_t v_batch_stride,
+    ptrdiff_t v_row_stride, ptrdiff_t v_head_stride, int num_splits) {
+    constexpr int WARP = 32, WARPS = 4, THREADS = WARP * WARPS;
+    static_assert(HEAD_SIZE == 128, "Shared-KV path is HD128 only.");
+    constexpr int DPT = HEAD_SIZE / WARP;
+    const int tid = threadIdx.x, warp = tid / WARP, lane = tid % WARP;
+    const int seq = blockIdx.y, split = static_cast<int>(blockIdx.z);
+    const int logical_heads = static_cast<int>(gridDim.x) * WARPS;
+    const int head = static_cast<int>(blockIdx.x) * WARPS + warp;
+    if (head >= logical_heads) return;
+    const int seq_len = static_cast<int>(cache_lens_[seq]);
+    const int shard = (seq_len + num_splits - 1) / num_splits;
+    const int start = split * shard, end = min(seq_len, start + shard);
+    const int n = static_cast<int>(gridDim.y) * logical_heads;
+    const int idx = split * n + seq * logical_heads + head;
+    float qreg[DPT], acc[DPT];
+#pragma unroll
+    for (int i = 0; i < DPT; ++i) { qreg[i] = 0.0f; acc[i] = 0.0f; }
+    const bool active = seq_len > 0 && num_splits > 0 && start < end;
+    const int qpkv = logical_heads / static_cast<int>(num_kv_heads);
+    const int kv_head = head / qpkv;
+    constexpr float LOG2E = 1.4426950408889634f;
+    const float scale_log2 = scale * LOG2E;
+    const float alibi = alibi_slopes_ == nullptr ? 0.0f : alibi_slopes_[head];
+    const int pbs = static_cast<int>(page_block_size);
+    if (active) {
+        const Tdata *qptr = q_ + seq * q_stride + head * HEAD_SIZE;
+#pragma unroll
+        for (int i = 0; i < DPT; ++i) qreg[i] = static_cast<float>(qptr[lane * DPT + i]);
+    }
+    __shared__ __align__(16) Tdata sh_k[TILE_TOKENS][HEAD_SIZE];
+    __shared__ __align__(16) Tdata sh_v[TILE_TOKENS][HEAD_SIZE];
+    const Tindex *table = block_tables_ + seq * static_cast<int>(max_num_blocks_per_seq);
+    float m = -INFINITY, l = 0.0f;
+    for (int tile = start; tile < end; tile += TILE_TOKENS) {
+        const int tn = min(TILE_TOKENS, end - tile);
+        for (int linear = tid; linear < TILE_TOKENS * HEAD_SIZE; linear += THREADS) {
+            const int j = linear / HEAD_SIZE, dim = linear - j * HEAD_SIZE;
+            if (j < tn) {
+                const int logical = tile + j, lb = logical / pbs, ti = logical - lb * pbs;
+                const int physical = static_cast<int>(table[lb]);
+                const Tdata *kp = k_cache_ + physical * k_batch_stride + kv_head * k_head_stride + ti * k_row_stride;
+                const Tdata *vp = v_cache_ + physical * v_batch_stride + kv_head * v_head_stride + ti * v_row_stride;
+                sh_k[j][dim] = kp[dim]; sh_v[j][dim] = vp[dim];
+            } else { sh_k[j][dim] = static_cast<Tdata>(0); sh_v[j][dim] = static_cast<Tdata>(0); }
+        }
+        __syncthreads();
+        if (active) {
+            for (int j = 0; j < tn; ++j) {
+                float qk = 0.0f;
+#pragma unroll
+                for (int i = 0; i < DPT; ++i) qk += qreg[i] * static_cast<float>(sh_k[j][lane * DPT + i]);
+                qk = warpReduceSum(qk);
+                float alpha = 1.0f, beta = 0.0f;
+                if (lane == 0) {
+                    float score = qk * scale_log2;
+                    if (alibi != 0.0f) score += alibi * static_cast<float>((tile + j) - (seq_len - 1)) * LOG2E;
+                    const float mn = fmaxf(m, score);
+                    alpha = exp2f(m - mn); beta = exp2f(score - mn); l = l * alpha + beta; m = mn;
+                }
+                alpha = __shfl_sync(0xffffffff, alpha, 0); beta = __shfl_sync(0xffffffff, beta, 0);
+#pragma unroll
+                for (int i = 0; i < DPT; ++i) {
+                    const int dim = lane * DPT + i;
+                    acc[i] = acc[i] * alpha + beta * static_cast<float>(sh_v[j][dim]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (lane == 0) { partial_m[idx] = m; partial_l[idx] = l; }
+#pragma unroll
+    for (int i = 0; i < DPT; ++i) partial_acc[idx * HEAD_SIZE + lane * DPT + i] = acc[i];
+}
+
 template <typename Tdata, int HEAD_SIZE>
 __device__ void flashAttentionDecodeSplitKvCombineWarpKernel(
     Tdata *out_,
