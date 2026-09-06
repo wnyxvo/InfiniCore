@@ -20,7 +20,8 @@ namespace op::paged_caching::cuda {
 
 template <
     typename Tdata, // Data type of the tensors (e.g., half, __nv_bfloat16)
-    int NUM_THREADS // Number of threads per block, configured at launch time
+    int NUM_THREADS, // Number of threads per block, configured at launch time
+    bool VECTORIZED = false // 8-byte path for four 16-bit values
     >
 __device__ void pagedCachingKernel(
     // ----- Output Tensors -----
@@ -39,12 +40,16 @@ __device__ void pagedCachingKernel(
     const ptrdiff_t v_src_stride,         // Stride between tokens in the source V tensor
     const ptrdiff_t k_src_head_stride,    // Stride between heads in the source K tensor
     const ptrdiff_t v_src_head_stride,    // Stride between heads in the source V tensor
+    const ptrdiff_t k_src_size_stride,    // Stride between elements in a source K head
+    const ptrdiff_t v_src_size_stride,    // Stride between elements in a source V head
     const ptrdiff_t k_cache_block_stride, // Stride between blocks in the K cache pool
     const ptrdiff_t v_cache_block_stride, // Stride between blocks in the V cache pool
     const ptrdiff_t k_cache_head_stride,  // Stride between heads in the K cache pool
     const ptrdiff_t v_cache_head_stride,  // Stride between heads in the V cache pool
     const ptrdiff_t k_cache_slot_stride,  // Stride between block slots in the K cache pool
-    const ptrdiff_t v_cache_slot_stride   // Stride between block slots in the V cache pool
+    const ptrdiff_t v_cache_slot_stride,  // Stride between block slots in the V cache pool
+    const ptrdiff_t k_cache_size_stride, // Stride between elements in a K cache head
+    const ptrdiff_t v_cache_size_stride  // Stride between elements in a V cache head
 ) {
     //================================================================================
     // 1. Identify Work Unit & Calculate Addresses
@@ -78,14 +83,29 @@ __device__ void pagedCachingKernel(
     Tdata *v_cache_block_base_ptr = v_cache_ptr + physical_block_idx * v_cache_block_stride;
     Tdata *v_dst_head_ptr = v_cache_block_base_ptr + head_idx * v_cache_head_stride + block_offset * v_cache_slot_stride;
 
-    //================================================================================
-    // 2. Perform Element-wise Data Copy (Safe, Non-Vectorized)
-    //================================================================================
-    for (int i = threadIdx.x; i < head_size; i += NUM_THREADS) {
-        k_dst_head_ptr[i] = k_src_head_ptr[i];
-    }
-    for (int i = threadIdx.x; i < v_head_size; i += NUM_THREADS) {
-        v_dst_head_ptr[i] = v_src_head_ptr[i];
+    // Every address is expressed in elements so arbitrary outer strides and
+    // storage offsets retain their existing semantics. The vector path is
+    // entered only when the host has proved unit innermost strides and 8-byte
+    // alignment for every token/head/slot address.
+    if constexpr (VECTORIZED) {
+        constexpr int ELEMENTS_PER_VECTOR = 4;
+        for (int i = threadIdx.x * ELEMENTS_PER_VECTOR; i < static_cast<int>(head_size); i += NUM_THREADS * ELEMENTS_PER_VECTOR) {
+            const auto *src = reinterpret_cast<const uint2 *>(k_src_head_ptr + i * k_src_size_stride);
+            auto *dst = reinterpret_cast<uint2 *>(k_dst_head_ptr + i * k_cache_size_stride);
+            *dst = *src;
+        }
+        for (int i = threadIdx.x * ELEMENTS_PER_VECTOR; i < static_cast<int>(v_head_size); i += NUM_THREADS * ELEMENTS_PER_VECTOR) {
+            const auto *src = reinterpret_cast<const uint2 *>(v_src_head_ptr + i * v_src_size_stride);
+            auto *dst = reinterpret_cast<uint2 *>(v_dst_head_ptr + i * v_cache_size_stride);
+            *dst = *src;
+        }
+    } else {
+        for (int i = threadIdx.x; i < static_cast<int>(head_size); i += NUM_THREADS) {
+            k_dst_head_ptr[i * k_cache_size_stride] = k_src_head_ptr[i * k_src_size_stride];
+        }
+        for (int i = threadIdx.x; i < static_cast<int>(v_head_size); i += NUM_THREADS) {
+            v_dst_head_ptr[i * v_cache_size_stride] = v_src_head_ptr[i * v_src_size_stride];
+        }
     }
 }
 
