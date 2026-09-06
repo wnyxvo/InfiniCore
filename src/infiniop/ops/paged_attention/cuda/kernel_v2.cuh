@@ -337,7 +337,7 @@ __device__ void flashAttentionDecodeWarpKernel(
 
 // Split-KV decode (FA2-style): each split scans a shard of KV and writes partial (m, l, acc)
 // to workspace, then a combine kernel merges splits into final out.
-template <typename Tindex, typename Tdata, int HEAD_SIZE>
+template <typename Tindex, typename Tdata, int HEAD_SIZE, int Q_PER_CTA = 1>
 __device__ void flashAttentionDecodeSplitKvWarpKernel(
     float *partial_acc, // [num_splits, num_seqs, num_heads, head_size]
     float *partial_m,   // [num_splits, num_seqs, num_heads]
@@ -362,10 +362,14 @@ __device__ void flashAttentionDecodeSplitKvWarpKernel(
     int num_splits) {
 
     const int seq_idx = blockIdx.y;
-    const int head_idx = blockIdx.x;
     const int split_idx = static_cast<int>(blockIdx.z);
-    const int lane = threadIdx.x;
     constexpr int kWarpSize = 32;
+    const int warp_id = threadIdx.x / kWarpSize;
+    const int lane = threadIdx.x % kWarpSize;
+    const int logical_heads = static_cast<int>(gridDim.x) * Q_PER_CTA;
+    const int head_idx = blockIdx.x * Q_PER_CTA + warp_id;
+    if (head_idx >= logical_heads) return;
+    static_assert(Q_PER_CTA == 1 || Q_PER_CTA == 4, "Q_PER_CTA must be 1 or 4.");
     static_assert(HEAD_SIZE == 64 || HEAD_SIZE == 128 || HEAD_SIZE == 192 || HEAD_SIZE == 256 || HEAD_SIZE == 576, "Only head_size 64/128/192/256/576 supported in v0.4.");
     static_assert(HEAD_SIZE % kWarpSize == 0, "HEAD_SIZE must be divisible by 32.");
     constexpr int DIMS_PER_THREAD = HEAD_SIZE / kWarpSize;
@@ -381,8 +385,8 @@ __device__ void flashAttentionDecodeSplitKvWarpKernel(
     const int end = min(seq_len, start + shard);
     if (start >= end) {
         // Empty shard => write neutral element.
-        const int n = gridDim.y * gridDim.x;
-        const int idx = (split_idx * n + seq_idx * gridDim.x + head_idx);
+        const int n = gridDim.y * logical_heads;
+        const int idx = (split_idx * n + seq_idx * logical_heads + head_idx);
         if (lane == 0) {
             partial_m[idx] = -INFINITY;
             partial_l[idx] = 0.0f;
@@ -395,7 +399,7 @@ __device__ void flashAttentionDecodeSplitKvWarpKernel(
         return;
     }
 
-    const int num_heads = gridDim.x;
+    const int num_heads = logical_heads;
     const int num_queries_per_kv = num_heads / static_cast<int>(num_kv_heads);
     const int kv_head_idx = head_idx / num_queries_per_kv;
 
@@ -540,8 +544,8 @@ __device__ void flashAttentionDecodeSplitKvWarpKernel(
         token_in_block = 0;
     }
 
-    const int n = gridDim.y * gridDim.x;
-    const int idx = (split_idx * n + seq_idx * gridDim.x + head_idx);
+    const int n = gridDim.y * logical_heads;
+    const int idx = (split_idx * n + seq_idx * logical_heads + head_idx);
     if (lane == 0) {
         partial_m[idx] = m;
         partial_l[idx] = l;
