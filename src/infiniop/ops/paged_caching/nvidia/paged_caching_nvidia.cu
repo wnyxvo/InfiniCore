@@ -7,12 +7,13 @@
 #include <cstdio>
 #include <cstring>
 
-template <typename Tdata, int NUM_THREADS, bool VECTORIZED = false>
+template <typename Tdata, int NUM_THREADS, bool VECTORIZED = false, int HEADS_PER_CTA = 1>
 INFINIOP_CUDA_KERNEL pagedCaching(
     Tdata *k_cache, Tdata *v_cache,
     const Tdata *k, const Tdata *v,
     const int64_t *slot_mapping,
     const size_t head_size, const size_t v_head_size, const size_t block_size,
+    const size_t num_kv_heads,
     const ptrdiff_t k_src_stride, const ptrdiff_t v_src_stride,
     const ptrdiff_t k_src_head_stride, const ptrdiff_t v_src_head_stride,
     const ptrdiff_t k_src_size_stride, const ptrdiff_t v_src_size_stride,
@@ -20,9 +21,9 @@ INFINIOP_CUDA_KERNEL pagedCaching(
     const ptrdiff_t k_cache_head_stride, const ptrdiff_t v_cache_head_stride,
     const ptrdiff_t k_cache_slot_stride, const ptrdiff_t v_cache_slot_stride,
     const ptrdiff_t k_cache_size_stride, const ptrdiff_t v_cache_size_stride) {
-    op::paged_caching::cuda::pagedCachingKernel<Tdata, NUM_THREADS, VECTORIZED>(
+    op::paged_caching::cuda::pagedCachingKernel<Tdata, NUM_THREADS, VECTORIZED, HEADS_PER_CTA>(
         k_cache, v_cache, k, v, slot_mapping, head_size, v_head_size,
-        block_size, k_src_stride, v_src_stride,
+        block_size, num_kv_heads, k_src_stride, v_src_stride,
         k_src_head_stride, v_src_head_stride, k_src_size_stride, v_src_size_stride,
         k_cache_block_stride, v_cache_block_stride, k_cache_head_stride, v_cache_head_stride, k_cache_slot_stride, v_cache_slot_stride,
         k_cache_size_stride, v_cache_size_stride);
@@ -62,7 +63,7 @@ infiniStatus_t Descriptor::create(
 
 // The launchKernel function is a templated helper to encapsulate the CUDA kernel launch.
 // It sets up grid/block dimensions and calls the device-side kernel.
-template <int NUM_THREADS, bool VECTORIZED = false>
+template <int NUM_THREADS, bool VECTORIZED = false, int HEADS_PER_CTA = 1>
 infiniStatus_t launchKernel(const PagedCachingInfo &info,
                             void *k_cache, void *v_cache,
                             infiniDtype_t dtype,
@@ -78,8 +79,9 @@ infiniStatus_t launchKernel(const PagedCachingInfo &info,
                             ptrdiff_t k_cache_size_stride, ptrdiff_t v_cache_size_stride,
                             cudaStream_t stream) {
 
-    // The 2D grid maps x to KV head and y to token; each CTA handles one pair.
-    dim3 grid(uint64_t(num_kv_heads), uint64_t(num_tokens), 1);
+    // The 2D grid maps x to head groups and y to tokens. A grouped CTA owns
+    // HEADS_PER_CTA warps, with one independent warp per KV head.
+    dim3 grid((uint64_t(num_kv_heads) + HEADS_PER_CTA - 1) / HEADS_PER_CTA, uint64_t(num_tokens), 1);
     // Block dimension is 1D, using the number of threads specified at compile time.
     dim3 block(NUM_THREADS);
 
@@ -88,7 +90,7 @@ infiniStatus_t launchKernel(const PagedCachingInfo &info,
 
     // Launch the device-side CUDA kernel.
     if (dtype == INFINI_DTYPE_F16) {
-        pagedCaching<half, NUM_THREADS, VECTORIZED>
+        pagedCaching<half, NUM_THREADS, VECTORIZED, HEADS_PER_CTA>
             <<<grid, block, shared_mem_size, stream>>>(
                 (half *)k_cache,
                 (half *)v_cache,
@@ -98,6 +100,7 @@ infiniStatus_t launchKernel(const PagedCachingInfo &info,
                 head_size,
                 v_head_size,
                 block_size,
+                num_kv_heads,
                 k_src_stride,
                 v_src_stride,
                 k_src_head_stride,
@@ -113,7 +116,7 @@ infiniStatus_t launchKernel(const PagedCachingInfo &info,
                 k_cache_size_stride,
                 v_cache_size_stride);
     } else if (dtype == INFINI_DTYPE_BF16) {
-        pagedCaching<__nv_bfloat16, NUM_THREADS, VECTORIZED>
+        pagedCaching<__nv_bfloat16, NUM_THREADS, VECTORIZED, HEADS_PER_CTA>
             <<<grid, block, shared_mem_size, stream>>>(
                 (__nv_bfloat16 *)k_cache,
                 (__nv_bfloat16 *)v_cache,
@@ -123,6 +126,7 @@ infiniStatus_t launchKernel(const PagedCachingInfo &info,
                 head_size,
                 v_head_size,
                 block_size,
+                num_kv_heads,
                 k_src_stride,
                 v_src_stride,
                 k_src_head_stride,
@@ -138,7 +142,7 @@ infiniStatus_t launchKernel(const PagedCachingInfo &info,
                 k_cache_size_stride,
                 v_cache_size_stride);
     } else if (dtype == INFINI_DTYPE_F32) {
-        pagedCaching<float, NUM_THREADS, VECTORIZED>
+        pagedCaching<float, NUM_THREADS, VECTORIZED, HEADS_PER_CTA>
             <<<grid, block, shared_mem_size, stream>>>(
                 (float *)k_cache,
                 (float *)v_cache,
@@ -148,6 +152,7 @@ infiniStatus_t launchKernel(const PagedCachingInfo &info,
                 head_size,
                 v_head_size,
                 block_size,
+                num_kv_heads,
                 k_src_stride,
                 v_src_stride,
                 k_src_head_stride,
@@ -217,17 +222,74 @@ infiniStatus_t Descriptor::calculate(
     const bool vector_requested = vector_env &&
         (std::strcmp(vector_env, "1") == 0 || std::strcmp(vector_env, "true") == 0);
     const bool vector_eligible = vector_path_eligible(_info, k_cache, v_cache, k, v);
-    const bool use_vector = requested_threads == 32 && vector_requested && vector_eligible;
-    const int selected_threads = requested_threads == 32 ? 32 :
+    int requested_heads_per_cta = 1;
+    if (const char *env = std::getenv("INFINIOP_PAGED_CACHING_HEADS_PER_CTA")) {
+        const int value = std::atoi(env);
+        if (value == 2 || value == 4) requested_heads_per_cta = value;
+    }
+    const bool grouped_e = requested_threads == 64 && requested_heads_per_cta == 2 && max_threads >= 64;
+    const bool grouped_f = requested_threads == 128 && requested_heads_per_cta == 4 && max_threads >= 128;
+    const bool grouped = grouped_e || grouped_f;
+    const bool use_vector = vector_requested && vector_eligible &&
+        ((requested_threads == 32 && requested_heads_per_cta == 1) || grouped);
+    const int selected_threads = grouped_e ? 64 : (grouped_f ? 128 :
+        (requested_threads == 32 ? 32 :
         (requested_threads == 128 ? 128 : (requested_threads == 256 ? 256 :
          (max_threads >= CUDA_BLOCK_SIZE_1024 ? CUDA_BLOCK_SIZE_1024 :
-          (max_threads >= CUDA_BLOCK_SIZE_512 ? CUDA_BLOCK_SIZE_512 : CUDA_BLOCK_SIZE_4096))));
+          (max_threads >= CUDA_BLOCK_SIZE_512 ? CUDA_BLOCK_SIZE_512 : CUDA_BLOCK_SIZE_4096))))));
+    const int selected_heads_per_cta = grouped ? requested_heads_per_cta : 1;
     if (std::getenv("INFINIOP_PAGED_CACHING_DEBUG")) {
-        std::fprintf(stderr, "[paged_caching] selected_threads=%d vector_requested=%d vector_eligible=%d vector_active=%d dtype=%d\n",
-                     selected_threads, static_cast<int>(vector_requested),
-                     static_cast<int>(vector_eligible), static_cast<int>(use_vector), static_cast<int>(_info.dtype));
+        std::fprintf(stderr, "[paged_caching] selected_threads=%d heads_per_cta=%d grid_x=%zu num_heads=%zu vector_requested=%d vector_eligible=%d vector_active=%d dtype=%d\n",
+                     selected_threads, selected_heads_per_cta,
+                     (_info.num_kv_heads + selected_heads_per_cta - 1) / selected_heads_per_cta, _info.num_kv_heads,
+                     static_cast<int>(vector_requested), static_cast<int>(vector_eligible),
+                     static_cast<int>(use_vector), static_cast<int>(_info.dtype));
     }
-    if (requested_threads == 32 && max_threads >= 32) {
+    if (grouped_e) {
+        if (use_vector) {
+            launchKernel<64, true, 2>(
+                _info, k_cache, v_cache, _info.dtype, k, v, slot_mapping,
+                _info.num_tokens, _info.num_kv_heads, _info.head_size, _info.v_head_size, _info.block_size,
+                _info.k_src_stride, _info.v_src_stride, _info.k_src_head_stride, _info.v_src_head_stride,
+                _info.k_src_size_stride, _info.v_src_size_stride,
+                _info.k_cache_block_stride, _info.v_cache_block_stride,
+                _info.k_cache_head_stride, _info.v_cache_head_stride,
+                _info.k_cache_slot_stride, _info.v_cache_slot_stride,
+                _info.k_cache_size_stride, _info.v_cache_size_stride, stream);
+        } else {
+            launchKernel<64, false, 2>(
+                _info, k_cache, v_cache, _info.dtype, k, v, slot_mapping,
+                _info.num_tokens, _info.num_kv_heads, _info.head_size, _info.v_head_size, _info.block_size,
+                _info.k_src_stride, _info.v_src_stride, _info.k_src_head_stride, _info.v_src_head_stride,
+                _info.k_src_size_stride, _info.v_src_size_stride,
+                _info.k_cache_block_stride, _info.v_cache_block_stride,
+                _info.k_cache_head_stride, _info.v_cache_head_stride,
+                _info.k_cache_slot_stride, _info.v_cache_slot_stride,
+                _info.k_cache_size_stride, _info.v_cache_size_stride, stream);
+        }
+    } else if (grouped_f) {
+        if (use_vector) {
+            launchKernel<128, true, 4>(
+                _info, k_cache, v_cache, _info.dtype, k, v, slot_mapping,
+                _info.num_tokens, _info.num_kv_heads, _info.head_size, _info.v_head_size, _info.block_size,
+                _info.k_src_stride, _info.v_src_stride, _info.k_src_head_stride, _info.v_src_head_stride,
+                _info.k_src_size_stride, _info.v_src_size_stride,
+                _info.k_cache_block_stride, _info.v_cache_block_stride,
+                _info.k_cache_head_stride, _info.v_cache_head_stride,
+                _info.k_cache_slot_stride, _info.v_cache_slot_stride,
+                _info.k_cache_size_stride, _info.v_cache_size_stride, stream);
+        } else {
+            launchKernel<128, false, 4>(
+                _info, k_cache, v_cache, _info.dtype, k, v, slot_mapping,
+                _info.num_tokens, _info.num_kv_heads, _info.head_size, _info.v_head_size, _info.block_size,
+                _info.k_src_stride, _info.v_src_stride, _info.k_src_head_stride, _info.v_src_head_stride,
+                _info.k_src_size_stride, _info.v_src_size_stride,
+                _info.k_cache_block_stride, _info.v_cache_block_stride,
+                _info.k_cache_head_stride, _info.v_cache_head_stride,
+                _info.k_cache_slot_stride, _info.v_cache_slot_stride,
+                _info.k_cache_size_stride, _info.v_cache_size_stride, stream);
+        }
+    } else if (requested_threads == 32 && max_threads >= 32) {
         if (use_vector) {
             launchKernel<32, true>(
                 _info, k_cache, v_cache, _info.dtype, k, v, slot_mapping,

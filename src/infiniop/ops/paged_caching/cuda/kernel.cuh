@@ -21,7 +21,8 @@ namespace op::paged_caching::cuda {
 template <
     typename Tdata, // Data type of the tensors (e.g., half, __nv_bfloat16)
     int NUM_THREADS, // Number of threads per block, configured at launch time
-    bool VECTORIZED = false // 8-byte path for four 16-bit values
+    bool VECTORIZED = false, // 8-byte path for four 16-bit values
+    int HEADS_PER_CTA = 1 // grouped mapping: one warp per KV head
     >
 __device__ void pagedCachingKernel(
     // ----- Output Tensors -----
@@ -35,6 +36,7 @@ __device__ void pagedCachingKernel(
     const size_t head_size,   // Dimension of each key head (dh_k)
     const size_t v_head_size, // Dimension of each value head (dh_v)
     const size_t block_size,  // Number of tokens per block in the KV cache
+    const size_t num_kv_heads,
     // ----- Stride Information -----
     const ptrdiff_t k_src_stride,         // Stride between tokens in the source K tensor
     const ptrdiff_t v_src_stride,         // Stride between tokens in the source V tensor
@@ -57,8 +59,22 @@ __device__ void pagedCachingKernel(
 
     // Each block processes one token.
     const int token_idx = blockIdx.y;
-    const int head_idx = blockIdx.x;
-    // const int num_kv_heads = gridDim.y;
+    // Single-head candidates retain their historical thread mapping (128/256
+    // threads cooperate on one head). Grouped candidates use one warp per head.
+    int head_idx;
+    int lane;
+    int stride;
+    if constexpr (HEADS_PER_CTA == 1) {
+        head_idx = blockIdx.x;
+        lane = threadIdx.x;
+        stride = NUM_THREADS;
+    } else {
+        const int warp_idx = threadIdx.x / 32;
+        lane = threadIdx.x % 32;
+        head_idx = blockIdx.x * HEADS_PER_CTA + warp_idx;
+        stride = 32;
+        if (head_idx >= static_cast<int>(num_kv_heads)) return;
+    }
 
     // Retrieve the destination slot for the current token.
     const int64_t slot_idx = slot_mapping_ptr[token_idx];
@@ -89,21 +105,21 @@ __device__ void pagedCachingKernel(
     // alignment for every token/head/slot address.
     if constexpr (VECTORIZED) {
         constexpr int ELEMENTS_PER_VECTOR = 4;
-        for (int i = threadIdx.x * ELEMENTS_PER_VECTOR; i < static_cast<int>(head_size); i += NUM_THREADS * ELEMENTS_PER_VECTOR) {
+        for (int i = lane * ELEMENTS_PER_VECTOR; i < static_cast<int>(head_size); i += stride * ELEMENTS_PER_VECTOR) {
             const auto *src = reinterpret_cast<const uint2 *>(k_src_head_ptr + i * k_src_size_stride);
             auto *dst = reinterpret_cast<uint2 *>(k_dst_head_ptr + i * k_cache_size_stride);
             *dst = *src;
         }
-        for (int i = threadIdx.x * ELEMENTS_PER_VECTOR; i < static_cast<int>(v_head_size); i += NUM_THREADS * ELEMENTS_PER_VECTOR) {
+        for (int i = lane * ELEMENTS_PER_VECTOR; i < static_cast<int>(v_head_size); i += stride * ELEMENTS_PER_VECTOR) {
             const auto *src = reinterpret_cast<const uint2 *>(v_src_head_ptr + i * v_src_size_stride);
             auto *dst = reinterpret_cast<uint2 *>(v_dst_head_ptr + i * v_cache_size_stride);
             *dst = *src;
         }
     } else {
-        for (int i = threadIdx.x; i < static_cast<int>(head_size); i += NUM_THREADS) {
+        for (int i = lane; i < static_cast<int>(head_size); i += stride) {
             k_dst_head_ptr[i * k_cache_size_stride] = k_src_head_ptr[i * k_src_size_stride];
         }
-        for (int i = threadIdx.x; i < static_cast<int>(v_head_size); i += NUM_THREADS) {
+        for (int i = lane; i < static_cast<int>(v_head_size); i += stride) {
             v_dst_head_ptr[i * v_cache_size_stride] = v_src_head_ptr[i * v_src_size_stride];
         }
     }
