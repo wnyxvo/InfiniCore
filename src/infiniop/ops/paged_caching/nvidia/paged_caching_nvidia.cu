@@ -2,6 +2,7 @@
 #include "../../../devices/nvidia/nvidia_kernel_common.cuh"
 #include "../cuda/kernel.cuh"
 #include "paged_caching_nvidia.cuh"
+#include <cstdlib>
 
 template <typename Tdata, int NUM_THREADS>
 INFINIOP_CUDA_KERNEL pagedCaching(
@@ -69,7 +70,7 @@ infiniStatus_t launchKernel(const PagedCachingInfo &info,
                             ptrdiff_t k_cache_slot_stride, ptrdiff_t v_cache_slot_stride,
                             cudaStream_t stream) {
 
-    // Grid dimension is 1D, with one block per token, as we decided.
+    // The 2D grid maps x to KV head and y to token; each CTA handles one pair.
     dim3 grid(uint64_t(num_kv_heads), uint64_t(num_tokens), 1);
     // Block dimension is 1D, using the number of threads specified at compile time.
     dim3 block(NUM_THREADS);
@@ -157,9 +158,28 @@ infiniStatus_t Descriptor::calculate(
 
     cudaStream_t stream = (cudaStream_t)stream_;
 
-    // Dispatch logic based on the GPU's maximum threads per block.
-    // This allows selecting the largest, most efficient block size the hardware supports.
-    if (_opaque->internal->maxThreadsPerBlock() >= CUDA_BLOCK_SIZE_1024) {
+    // Default remains 1024 threads. An explicit test-only override allows
+    // comparing existing template instantiations without changing grid/layout.
+    int requested_threads = 0;
+    if (const char *env = std::getenv("INFINIOP_PAGED_CACHING_THREADS")) {
+        requested_threads = std::atoi(env);
+    }
+    const int max_threads = _opaque->internal->maxThreadsPerBlock();
+    if (requested_threads == 128 && max_threads >= 128) {
+        launchKernel<128>(
+            _info, k_cache, v_cache, _info.dtype, k, v, slot_mapping,
+            _info.num_tokens, _info.num_kv_heads, _info.head_size, _info.v_head_size, _info.block_size,
+            _info.k_src_stride, _info.v_src_stride, _info.k_src_head_stride, _info.v_src_head_stride,
+            _info.k_cache_block_stride, _info.v_cache_block_stride, _info.k_cache_head_stride, _info.v_cache_head_stride,
+            _info.k_cache_slot_stride, _info.v_cache_slot_stride, stream);
+    } else if (requested_threads == 256 && max_threads >= 256) {
+        launchKernel<256>(
+            _info, k_cache, v_cache, _info.dtype, k, v, slot_mapping,
+            _info.num_tokens, _info.num_kv_heads, _info.head_size, _info.v_head_size, _info.block_size,
+            _info.k_src_stride, _info.v_src_stride, _info.k_src_head_stride, _info.v_src_head_stride,
+            _info.k_cache_block_stride, _info.v_cache_block_stride, _info.k_cache_head_stride, _info.v_cache_head_stride,
+            _info.k_cache_slot_stride, _info.v_cache_slot_stride, stream);
+    } else if (max_threads >= CUDA_BLOCK_SIZE_1024) {
         // Dispatch based on data type for a 1024-thread block.
         launchKernel<CUDA_BLOCK_SIZE_1024>(
             _info, k_cache, v_cache, _info.dtype, k, v, slot_mapping,

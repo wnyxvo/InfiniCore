@@ -8,13 +8,12 @@
 // vectors from a contiguous source tensor into a paged, non-contiguous KV Cache.
 //
 // Design Principles:
-// 1. Token-Centric Parallelism: A 1D grid of `num_tokens` is launched. Each CUDA
-//    block is responsible for caching one full token (all its heads).
-// 2. Coalesced Memory Access: This grid strategy ensures that threads within a
-//    block read a large, contiguous chunk of memory from the source tensors,
-//    maximizing memory bandwidth utilization.
-// 3. Vectorization: The copy operation is vectorized to further enhance memory
-//    throughput, processing multiple data elements in a single instruction.
+// 1. Token/head parallelism: a 2D grid maps x to KV head and y to token;
+//    each CUDA block copies one token for one KV head.
+// 2. Scalar strided copy: each thread covers elements `threadIdx.x + n*NUM_THREADS`;
+//    no vectorized instruction is assumed by this implementation.
+// 3. Layout preservation: source and cache strides are supplied by the descriptor,
+//    so padding and non-contiguous supported layouts retain their slot semantics.
 //================================================================================
 
 namespace op::paged_caching::cuda {
